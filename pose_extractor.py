@@ -22,6 +22,17 @@ COCO_17_TO_CUSTOM_12: Sequence[int] = (
 )
 
 
+def _looks_like_git_lfs_pointer(path: Path) -> bool:
+    """Detect the small text stub that Git LFS leaves behind when weights are missing."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(128)
+    except OSError:
+        return False
+    marker = b"version https://git-lfs.github.com/spec/v1"
+    return head.startswith(marker)
+
+
 @dataclass
 class PoseSequence:
     keypoints: np.ndarray  # shape (T, K, 2) in [0,1]
@@ -55,6 +66,21 @@ def extract_pose_sequence(
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     model_source = str(model_path)
+    resolved_model_path: Optional[Path] = None
+    try:
+        candidate_path = Path(model_path)
+    except TypeError:
+        candidate_path = None
+
+    if candidate_path is not None and candidate_path.exists():
+        resolved_model_path = candidate_path.resolve()
+        if _looks_like_git_lfs_pointer(resolved_model_path):
+            raise RuntimeError(
+                f"Model weights at {resolved_model_path} appear to be a Git LFS pointer. "
+                "Run `git lfs pull` (or download the full .pt file) before scoring poses."
+            )
+        model_source = str(resolved_model_path)
+
     try:
         model = YOLO(model_source)
     except FileNotFoundError as exc:
@@ -141,8 +167,8 @@ def extract_pose_sequence(
                         points = padded
                         if vis is not None:
                             vis_pad = np.zeros((num_keypoints,), dtype=float)
-                        vis_pad[: vis.shape[0]] = vis
-                        vis = vis_pad
+                            vis_pad[: vis.shape[0]] = vis
+                            vis = vis_pad
                 kp[:, 0] = points[:, 0] / max(width, 1)
                 kp[:, 1] = points[:, 1] / max(height, 1)
                 if vis is not None:

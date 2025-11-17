@@ -1,3 +1,7 @@
+# ---------------------------------------------------------
+# scoring.py
+# ---------------------------------------------------------
+
 import math
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
@@ -20,6 +24,24 @@ KEYPOINT_NAMES = [
     "R_Ankle",
     "L_Ankle",
 ]
+
+# ส่วนที่เพิ่มเข้ามาสำหรับการ Map ภาษาไทย
+KEYPOINT_NAMES_THAI = [
+    "ไหล่ขวา", "ไหล่ซ้าย", "ศอกขวา", "ศอกซ้าย", "ข้อมือขวา", "ข้อมือซ้าย",
+    "สะโพกขวา", "สะโพกซ้าย", "เข่าขวา", "เข่าซ้าย", "ข้อเท้าขวา", "ข้อเท้าซ้าย",
+]
+KEYPOINT_MAPPING_THAI = dict(zip(KEYPOINT_NAMES, KEYPOINT_NAMES_THAI))
+
+# dataclass สำหรับเก็บผลลัพธ์การคำนวณ (จำเป็นต้องมีก่อนถูกเรียกใช้)
+@dataclass
+class ScoreResult:
+    avg_distance: float
+    avg_similarity: float
+    joint_distances: np.ndarray
+    joint_similarities: np.ndarray
+    per_frame_similarity: np.ndarray
+    per_frame_distance: np.ndarray
+    path_ij: np.ndarray
 
 
 def interpolate_sequence_nans(seq_xy: np.ndarray) -> np.ndarray:
@@ -93,17 +115,6 @@ def _dtw_frames_path(A_flat: np.ndarray, B_flat: np.ndarray) -> Tuple[np.ndarray
     return np.array(path, dtype=int), cost
 
 
-@dataclass
-class ScoreResult:
-    avg_distance: float
-    avg_similarity: float
-    joint_distances: np.ndarray
-    joint_similarities: np.ndarray
-    per_frame_similarity: np.ndarray
-    per_frame_distance: np.ndarray
-    path_ij: np.ndarray
-
-
 def exp_similarity(dist: float, alpha: float) -> float:
     """Convert DTW distance to similarity percentage via exponential decay."""
     return float(100.0 * math.exp(-alpha * dist))
@@ -174,35 +185,54 @@ def compute_similarity(
         path_ij=path_ij,
     )
 
+# ---------------------------------------------------------
+# ส่วนที่เพิ่มเข้ามาเพื่อจัดรูปแบบผลลัพธ์สำหรับ Unity (JSON)
+# ---------------------------------------------------------
 
-def yolo_txt_to_sequence(folder: str, num_kpts: int = NUM_KEYPOINTS) -> np.ndarray:
-    """Load YOLO keypoint txt files into a (T,K,2) array normalised to [0,1]."""
-    import glob
-    import os
-    import re
+def _get_joint_data(index: int, result: ScoreResult) -> dict:
+    """สร้าง dictionary ข้อมูลของข้อต่อเดียว"""
+    joint_name_en = KEYPOINT_NAMES[index]
+    return {
+        "joint_name_en": joint_name_en,
+        "joint_name_th": KEYPOINT_MAPPING_THAI.get(joint_name_en, joint_name_en),
+        "similarity_pct": float(round(result.joint_similarities[index], 2)),
+        "distance": float(round(result.joint_distances[index], 5)),
+    }
 
-    def natural_key(name: str) -> List[object]:
-        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+def format_result_for_unity(result: ScoreResult, reference_name: str) -> dict:
+    """
+    จัดโครงสร้างผลลัพธ์ทั้งหมดให้เป็น Dictionary ที่พร้อมส่งเป็น JSON
+    โดยมีการสรุปผลสูงสุด/ต่ำสุด และ Map ชื่อข้อต่อให้เป็นภาษาไทย
+    """
+    joint_sims = result.joint_similarities
+    valid_mask = np.isfinite(joint_sims)
 
-    txts = sorted(glob.glob(os.path.join(folder, "*.txt")), key=natural_key)
-    if not txts:
-        raise FileNotFoundError(f"No .txt files in {folder}")
+    highest_data = {}
+    lowest_data = {}
 
-    frames: List[np.ndarray] = []
-    for path in txts:
-        with open(path) as fh:
-            line = fh.readline().strip()
-        if not line:
-            frames.append(np.full((num_kpts, 2), np.nan, dtype=float))
-            continue
-        values = [float(v) for v in line.split()]
-        expect = 5 + num_kpts * 3
-        if len(values) < expect:
-            frames.append(np.full((num_kpts, 2), np.nan, dtype=float))
-            continue
-        pts = np.array(values[5 : 5 + num_kpts * 3], dtype=float).reshape(num_kpts, 3)
-        xy = pts[:, :2]
-        vis = pts[:, 2]
-        xy[vis <= 0.0] = np.nan
-        frames.append(xy)
-    return np.stack(frames, axis=0)
+    if valid_mask.any():
+        # หา index ของ joint ที่คล้ายและต่างกันที่สุด
+        highest_idx = int(np.nanargmax(joint_sims))
+        lowest_idx = int(np.nanargmin(joint_sims))
+        
+        highest_data = _get_joint_data(highest_idx, result)
+        lowest_data = _get_joint_data(lowest_idx, result)
+    
+    # รวมผลลัพธ์ทั้งหมด
+    all_joints_data = [
+        _get_joint_data(i, result)
+        for i in range(len(KEYPOINT_NAMES)) if np.isfinite(result.joint_similarities[i])
+    ]
+
+    return {
+        "summary": {
+            "average_similarity_pct": float(round(result.avg_similarity, 2)),
+            "average_distance": float(round(result.avg_distance, 5)),
+        },
+        "highest_similarity": highest_data,
+        "lowest_similarity": lowest_data,
+        "all_joints": all_joints_data,
+        "reference_name": reference_name, # ชื่อท่าอ้างอิง
+    }
+
+# ---------------------------------------------------------

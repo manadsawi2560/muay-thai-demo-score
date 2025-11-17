@@ -1,3 +1,7 @@
+# ---------------------------------------------------------
+# api_ref_server.py
+# ---------------------------------------------------------
+
 import shutil
 import tempfile
 from pathlib import Path
@@ -7,12 +11,14 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+# ต้องสมมติว่าคุณมีไฟล์ pose_extractor.py และ scoring.py ใน directory เดียวกัน
+# นำเข้าฟังก์ชันจัดรูปแบบผลลัพธ์มาใช้
 from pose_extractor import extract_pose_sequence
-from scoring import KEYPOINT_NAMES, ScoreResult, compute_similarity
+from scoring import KEYPOINT_NAMES, ScoreResult, compute_similarity, format_result_for_unity
 
 
 # ---------------------------------------------------------
-#  Config & App setup
+# Config & App setup
 # ---------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -26,7 +32,7 @@ app = FastAPI(title="Muay Thai Pose Scoring API (reference on server)")
 # เปิด CORS ให้ Unity/WebGL ยิงข้าม origin ได้ตอน dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # production ค่อยล็อก origin ทีหลัง
+    allow_origins=["*"],    # production ค่อยล็อก origin ทีหลัง
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,7 +40,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-#  Helper functions
+# Helper functions
 # ---------------------------------------------------------
 def _save_upload(upload: UploadFile) -> Path:
     """Save uploaded video to a temporary file and return its path."""
@@ -49,38 +55,11 @@ def _save_upload(upload: UploadFile) -> Path:
         tmp.close()
 
 
-def _summarise_joints(result: ScoreResult):
-    """
-    สรุป joint ที่ similarity สูงสุด / ต่ำสุด
-    ใช้โค้ดเดิมของคุณได้เลย
-    """
-    joint_sims = result.joint_similarities
-    valid_mask = np.isfinite(joint_sims)
-    if not valid_mask.any():
-        return None, None
-    highest_idx = int(np.nanargmax(joint_sims))
-    lowest_idx = int(np.nanargmin(joint_sims))
-    highest = {
-        "joint": KEYPOINT_NAMES[highest_idx],
-        "similarity": float(joint_sims[highest_idx]),
-        "distance": float(result.joint_distances[highest_idx]),
-    }
-    lowest = {
-        "joint": KEYPOINT_NAMES[lowest_idx],
-        "similarity": float(joint_sims[lowest_idx]),
-        "distance": float(result.joint_distances[lowest_idx]),
-    }
-    return highest, lowest
-
-
 # map ชื่อ reference_name ที่ Unity ส่งมา → path ไฟล์บน server
 REFERENCE_VIDEOS: Dict[str, Path] = {
     # ปรับชื่อ key และไฟล์ให้ตรงกับที่คุณมีจริง ๆ
     "R_jab_1": REFERENCE_DIR / "R_jab_ref1.mp4",
     "R_jab_2": REFERENCE_DIR / "R_jab_ref2.mp4",
-    # ตัวอย่าง
-    # "L_jab_1": REFERENCE_DIR / "L_jab_ref1.mp4",
-    # "R_kick_1": REFERENCE_DIR / "R_kick_ref1.mp4",
 }
 
 
@@ -102,7 +81,7 @@ def _get_reference_path(reference_name: str) -> Path:
 
 
 # ---------------------------------------------------------
-#  Main endpoint: ใช้ reference_name ฝั่ง server
+# Main endpoint: ใช้ reference_name ฝั่ง server
 # ---------------------------------------------------------
 @app.post("/score")
 async def score_pose_with_server_reference(
@@ -116,9 +95,8 @@ async def score_pose_with_server_reference(
     alpha: float = Form(1.0),
 ):
     """
-    Endpoint เวอร์ชันใหม่:
-    - รับเฉพาะ trainee_video จาก Unity
-    - reference video อยู่ฝั่ง server เลือกจาก reference_name
+    Endpoint สำหรับรับวิดีโอจากผู้ฝึก (trainee_video) และใช้ reference video 
+    ที่เลือกจากชื่อ (reference_name) บน Server ในการคำนวณ Pose Similarity
     """
 
     user_path: Optional[Path] = None
@@ -132,6 +110,7 @@ async def score_pose_with_server_reference(
 
         # 3) Extract pose sequence ของทั้งสอง
         try:
+            # สมมติว่า extract_pose_sequence คืนค่า object ที่มี attribute .keypoints
             seq_user = extract_pose_sequence(
                 user_path,
                 model_path,
@@ -157,32 +136,24 @@ async def score_pose_with_server_reference(
         if not np.isfinite(seq_ref.keypoints).any():
             raise HTTPException(status_code=422, detail="No keypoints detected in reference video.")
 
-        # 5) คำนวณ similarity (ใช้ compute_similarity เดิม)
+        # 5) คำนวณ similarity 
         try:
             result = compute_similarity(seq_user.keypoints, seq_ref.keypoints, alpha=float(alpha))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}")
 
-        # 6) สรุป joint ที่ดีที่สุด/แย่ที่สุด
-        highest, lowest = _summarise_joints(result)
-
-        # 7) สร้าง response
-        response = {
-            "average_similarity": float(result.avg_similarity),
-            "average_distance": float(result.avg_distance),
-            "highest_joint_similarity": highest,
-            "lowest_joint_similarity": lowest,
-            # optional: ถ้าอยากใช้ต่อใน Unity ภายหลัง สามารถส่งเพิ่มได้
-            # "per_frame_similarity": result.per_frame_similarity.tolist(),
-            # "per_frame_distance": result.per_frame_distance.tolist(),
-            "reference_name": reference_name,
-        }
+        # 6) สรุปผลและจัดรูปแบบโดยเรียกใช้ฟังก์ชันจาก scoring.py
+        # ฟังก์ชันนี้จะรวมการสรุปผลและ Map key ทั้งหมดไว้แล้ว
+        response = format_result_for_unity(result, reference_name)
+        
         return response
 
     finally:
-        # ลบไฟล์ชั่วคราวของ trainee ออก (reference video ไม่ลบ)
+        # ลบไฟล์ชั่วคราวของ trainee ออก
         try:
             if user_path and user_path.exists():
                 user_path.unlink()
         except Exception:
             pass
+
+# ---------------------------------------------------------
